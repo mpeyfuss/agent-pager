@@ -1,0 +1,12 @@
+[package]
+name = "agent-pager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+objc2-user-notifications = "0.3"
+serde_json = { version = "1", features = ["preserve_order"] }
