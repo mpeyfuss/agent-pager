@@ -65,16 +65,14 @@ pub fn post(ev: &Event, focus_bundle: Option<String>) -> Result<(), String> {
         return Err("notifications are not allowed for this app (System Settings → Notifications)".into());
     }
 
-    // "<repo> · <status>", repo being the git root's folder name.
-    let repo = ev
+    // Title is the git root's folder name; with no cwd it stays empty and
+    // macOS shows the app name instead.
+    let title = ev
         .cwd
         .as_deref()
         .map(project_root)
-        .and_then(|root| Path::new(&root).file_name().map(|n| n.to_string_lossy().into_owned()));
-    let title = match repo {
-        Some(repo) => format!("{repo} · {}", ev.kind.label()),
-        None => ev.kind.label().to_string(),
-    };
+        .and_then(|root| Path::new(&root).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default();
 
     let content = UNMutableNotificationContent::new();
     content.setTitle(&NSString::from_str(&title));

@@ -37,12 +37,9 @@ From source instead: `cargo build --release && ./target/release/agent-pager setu
 
 ## Releasing
 
-Push a tag. GitHub Actions builds the universal binary and publishes the release:
-
-```sh
-# bump version in Cargo.toml first
-git tag v0.1.0 && git push origin v0.1.0
-```
+Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), then push to `main`.
+If no `v<version>` release exists yet, GitHub Actions builds the universal binary, tags the
+commit and publishes the release. The workflow can also be run by hand from the Actions tab.
 
 The repo must be public for `install.sh` to download releases without auth.
 

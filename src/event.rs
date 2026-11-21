@@ -83,15 +83,6 @@ impl Kind {
             .into_iter()
             .find(|k| k.key() == s)
     }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Kind::Approval => "Prompt",
-            Kind::Input => "Question",
-            Kind::Finished => "Stop",
-            Kind::Error => "Error",
-        }
-    }
 }
 
 #[derive(Debug)]
