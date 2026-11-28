@@ -203,6 +203,7 @@ const EDITOR_BUNDLES: &[&str] = &[
     "com.todesktop.230313mzl4w4u92", // Cursor
     "com.exafunction.windsurf",
     "dev.zed.Zed",
+    "com.google.antigravity-ide",
 ];
 
 /// Bring the app the agent ran in to the front. For editors, open the

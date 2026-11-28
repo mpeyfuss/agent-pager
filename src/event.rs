@@ -8,9 +8,10 @@ pub enum Agent {
     Claude,
     Codex,
     OpenCode,
+    Antigravity,
 }
 
-pub const ALL_AGENTS: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::OpenCode];
+pub const ALL_AGENTS: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::OpenCode, Agent::Antigravity];
 
 impl Agent {
     pub fn parse(s: &str) -> Option<Agent> {
@@ -18,6 +19,7 @@ impl Agent {
             "claude" | "claude-code" => Some(Agent::Claude),
             "codex" => Some(Agent::Codex),
             "opencode" => Some(Agent::OpenCode),
+            "antigravity" | "agy" => Some(Agent::Antigravity),
             _ => None,
         }
     }
@@ -28,6 +30,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::OpenCode => "opencode",
+            Agent::Antigravity => "antigravity",
         }
     }
 
@@ -37,6 +40,7 @@ impl Agent {
             Agent::Claude => "Claude Code",
             Agent::Codex => "Codex",
             Agent::OpenCode => "OpenCode",
+            Agent::Antigravity => "Antigravity",
         }
     }
 
@@ -46,6 +50,7 @@ impl Agent {
             Agent::Claude => "ClaudePager.app",
             Agent::Codex => "CodexPager.app",
             Agent::OpenCode => "OpenCodePager.app",
+            Agent::Antigravity => "AntigravityPager.app",
         }
     }
 
@@ -121,10 +126,25 @@ const MAX_BODY_CHARS: usize = 90;
 /// Map a raw hook payload to an `Event`. Returns `None` for events we
 /// deliberately ignore (e.g. Claude's idle reminder, which `Stop` covers).
 pub fn from_payload(agent: Agent, v: &Value) -> Option<Event> {
-    let name = str_at(v, "hook_event_name").unwrap_or_default();
-    let cwd = str_at(v, "cwd");
+    let raw_name = str_at(v, "hook_event_name")
+        .or_else(|| str_at(v, "hookEventName"))
+        .unwrap_or_default();
+    let name = if !raw_name.is_empty() {
+        raw_name.as_str()
+    } else if agent == Agent::Antigravity && v.get("toolCall").is_some() {
+        "PreToolUse"
+    } else if agent == Agent::Antigravity
+        && (v.get("terminationReason").is_some() || v.get("executionNum").is_some())
+    {
+        "Stop"
+    } else {
+        ""
+    };
+    let cwd = str_at(v, "cwd")
+        .filter(|s| !s.is_empty())
+        .or_else(|| first_workspace_path(v));
 
-    let (kind, body) = match (agent, name.as_str()) {
+    let (kind, body) = match (agent, name) {
         (Agent::Claude, "Notification") => {
             let kind = match str_at(v, "notification_type").as_deref() {
                 Some("permission_prompt") => Kind::Approval,
@@ -147,6 +167,35 @@ pub fn from_payload(agent: Agent, v: &Value) -> Option<Event> {
         (Agent::OpenCode, "error") => (Kind::Error, str_at(v, "message")),
         (Agent::OpenCode, "permission") => (Kind::Approval, str_at(v, "message")),
         (Agent::OpenCode, "input") => (Kind::Input, str_at(v, "message")),
+
+        (Agent::Antigravity, "Stop") => {
+            let reason = str_at(v, "terminationReason").unwrap_or_default();
+            let reason_upper = reason.to_ascii_uppercase();
+            if reason_upper == "USER_CANCELED" {
+                return None;
+            }
+            let err = str_at(v, "error").filter(|s| !s.trim().is_empty());
+            if err.is_some() || reason_upper == "ERROR" {
+                (Kind::Error, err)
+            } else {
+                // Background commands or subagents are still running; wait for the final Stop.
+                if v.get("fullyIdle").and_then(Value::as_bool) == Some(false) {
+                    return None;
+                }
+                let msg = str_at(v, "last_assistant_message").or_else(|| {
+                    str_at(v, "transcriptPath").and_then(|p| last_transcript_message(&p))
+                });
+                (Kind::Finished, msg)
+            }
+        }
+        (Agent::Antigravity, "PreToolUse") => {
+            let tool_call = v.get("toolCall")?;
+            match str_at(tool_call, "name").as_deref() {
+                Some("ask_question") => (Kind::Input, agy_question_text(tool_call)),
+                Some("ask_permission") => (Kind::Approval, agy_permission_text(tool_call)),
+                _ => return None,
+            }
+        }
         _ => return None,
     };
 
@@ -212,6 +261,114 @@ fn codex_permission_text(v: &Value) -> Option<String> {
     }
 }
 
+fn first_workspace_path(v: &Value) -> Option<String> {
+    v.get("workspacePaths")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn agy_question_text(tool_call: &Value) -> Option<String> {
+    tool_call
+        .get("args")?
+        .get("questions")?
+        .as_array()?
+        .first()?
+        .get("question")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn agy_permission_text(tool_call: &Value) -> Option<String> {
+    let args = tool_call.get("args")?;
+    if let Some(reason) = str_at(args, "Reason")
+        .or_else(|| str_at(args, "reason"))
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(reason);
+    }
+    let action = str_at(args, "Action")
+        .or_else(|| str_at(args, "action"))
+        .filter(|s| !s.trim().is_empty());
+    let target = str_at(args, "Target")
+        .or_else(|| str_at(args, "target"))
+        .filter(|s| !s.trim().is_empty());
+    match (action, target) {
+        (Some(a), Some(t)) => Some(format!("{a}: {t}")),
+        (None, Some(t)) => Some(t),
+        (Some(a), None) => Some(format!("Wants permission for {a}")),
+        (None, None) => None,
+    }
+}
+
+/// Read the last assistant reply from an Antigravity `transcript.jsonl` file.
+fn last_transcript_message(path: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let expanded = if let Some(rest) = path.strip_prefix("~/") {
+        crate::home().join(rest)
+    } else {
+        std::path::PathBuf::from(path)
+    };
+    let mut f = std::fs::File::open(expanded).ok()?;
+    const TAIL_BYTES: u64 = 128 * 1024;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut lines = text.lines();
+    if start > 0 {
+        // The tail slice may start mid-line.
+        lines.next();
+    }
+    for line in lines.rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if str_at(&entry, "type").as_deref() == Some("PLANNER_RESPONSE") {
+            if let Some(content) = str_at(&entry, "content").filter(|s| !s.trim().is_empty()) {
+                return Some(content);
+            }
+        }
+    }
+    None
+}
+
+/// Replace markdown links `[label](target)` with `label`.
+fn strip_markdown_links(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open_b) = rest.find('[') {
+        out.push_str(&rest[..open_b]);
+        let after_open = &rest[open_b + 1..];
+        if let Some(close_b) = after_open.find("](") {
+            let label = &after_open[..close_b];
+            let after_paren = &after_open[close_b + 2..];
+            if !label.contains('\n') {
+                if let Some(close_p) = after_paren.find(')') {
+                    out.push_str(label);
+                    rest = &after_paren[close_p + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push('[');
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Reduce a message to a one-liner: first non-empty line, markdown markers
 /// stripped, first sentence only, truncated.
 fn clean(s: &str) -> String {
@@ -223,6 +380,7 @@ fn clean(s: &str) -> String {
         .or(lines.first())
         .map(|l| l.trim_start_matches(['#', '-', '*', '>', ' ']))
         .unwrap_or_default();
+    let line = strip_markdown_links(line);
     let line: String = line.chars().filter(|c| !matches!(c, '`' | '*')).collect();
     let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let line = match line.find(". ") {
@@ -325,5 +483,112 @@ mod tests {
     fn empty_body_gets_default() {
         let ev = from_payload(Agent::OpenCode, &json!({"hook_event_name":"finished"})).unwrap();
         assert_eq!(ev.body, "Finished responding");
+    }
+
+    #[test]
+    fn one_liner_strips_markdown_links() {
+        assert_eq!(
+            clean("Updated [src/main.rs](file:///tmp/src/main.rs#L10-L20) and tests."),
+            "Updated src/main.rs and tests."
+        );
+    }
+
+    #[test]
+    fn antigravity_stop_reads_transcript_and_workspace_path() {
+        let p = std::env::temp_dir().join(format!("agent-pager-agy-transcript-{}.jsonl", std::process::id()));
+        let transcript = concat!(
+            "{\"type\":\"USER_INPUT\",\"content\":\"Fix it\"}\n",
+            "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"All **tests** pass in [main.rs](file:///a/main.rs). More details.\"}\n",
+            "{\"type\":\"GENERIC\",\"content\":\"ignored\"}\n",
+        );
+        std::fs::write(&p, transcript).unwrap();
+
+        let ev = from_payload(
+            Agent::Antigravity,
+            &json!({
+                "hookEventName": "Stop",
+                "terminationReason": "NO_TOOL_CALL",
+                "fullyIdle": true,
+                "workspacePaths": ["/repo/project"],
+                "transcriptPath": p.to_string_lossy(),
+            }),
+        )
+        .unwrap();
+        std::fs::remove_file(&p).unwrap();
+
+        assert_eq!(ev.kind, Kind::Finished);
+        assert_eq!(ev.body, "All tests pass in main.rs.");
+        assert_eq!(ev.cwd.as_deref(), Some("/repo/project"));
+    }
+
+    #[test]
+    fn antigravity_stop_error_and_ignores() {
+        let err = from_payload(
+            Agent::Antigravity,
+            &json!({
+                "hookEventName": "Stop",
+                "terminationReason": "ERROR",
+                "error": "Quota exceeded",
+                "cwd": "/tmp/x",
+            }),
+        )
+        .unwrap();
+        assert_eq!(err.kind, Kind::Error);
+        assert_eq!(err.body, "Quota exceeded");
+
+        assert!(from_payload(
+            Agent::Antigravity,
+            &json!({"hookEventName": "Stop", "terminationReason": "USER_CANCELED", "fullyIdle": true})
+        )
+        .is_none());
+
+        assert!(from_payload(
+            Agent::Antigravity,
+            &json!({"hookEventName": "Stop", "terminationReason": "NO_TOOL_CALL", "fullyIdle": false})
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn antigravity_pre_tool_use_question_and_permission() {
+        let q = from_payload(
+            Agent::Antigravity,
+            &json!({
+                "hookEventName": "PreToolUse",
+                "toolCall": {
+                    "name": "ask_question",
+                    "args": { "questions": [{ "question": "Which database should I use?" }] }
+                },
+                "cwd": "/tmp/x"
+            }),
+        )
+        .unwrap();
+        assert_eq!(q.kind, Kind::Input);
+        assert_eq!(q.body, "Which database should I use?");
+
+        let perm = from_payload(
+            Agent::Antigravity,
+            &json!({
+                "hookEventName": "PreToolUse",
+                "toolCall": {
+                    "name": "ask_permission",
+                    "args": { "Action": "command", "Target": "git push" }
+                },
+                "cwd": "/tmp/x"
+            }),
+        )
+        .unwrap();
+        assert_eq!(perm.kind, Kind::Approval);
+        assert_eq!(perm.body, "command: git push");
+
+        // Regular tools should not notify.
+        assert!(from_payload(
+            Agent::Antigravity,
+            &json!({
+                "hookEventName": "PreToolUse",
+                "toolCall": { "name": "run_command", "args": { "CommandLine": "ls" } }
+            })
+        )
+        .is_none());
     }
 }

@@ -21,6 +21,7 @@ fn embedded_icon(agent: Agent) -> &'static [u8] {
         Agent::Claude => include_bytes!("../assets/claude.png"),
         Agent::Codex => include_bytes!("../assets/codex.png"),
         Agent::OpenCode => include_bytes!("../assets/opencode.png"),
+        Agent::Antigravity => include_bytes!("../assets/antigravity.png"),
     }
 }
 

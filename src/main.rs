@@ -1,5 +1,5 @@
 //! agent-pager: native macOS notifications for coding agents
-//! (Claude Code, Codex, OpenCode), with a separate icon per agent.
+//! (Claude Code, Codex, OpenCode, Antigravity), with a separate icon per agent.
 
 mod config;
 mod event;
@@ -21,17 +21,18 @@ agent-pager: native macOS notifications for coding agents
 USAGE:
   agent-pager setup [--claude-dir DIR]... [--assets DIR] [--dest DIR]
         Build the pager apps and add hooks to every detected agent config
-        (~/.claude*, ~/.codex, ~/.config/opencode). Safe to re-run; backs up files.
+        (~/.claude*, ~/.codex, ~/.config/opencode, ~/.gemini/config).
+        Safe to re-run; backs up files.
   agent-pager teardown [--claude-dir DIR]... [--dest DIR]
         Remove the hooks and the pager apps.
-  agent-pager test <claude|codex|opencode> [approval|input|finished|error]
+  agent-pager test <claude|codex|opencode|antigravity> [approval|input|finished|error]
         Send a sample notification through the installed app.
   agent-pager install [--assets DIR] [--dest DIR]
         Only (re)build the pager apps (default dest ~/Applications/AgentPager).
         --assets overrides the built-in icons with DIR/<agent>.png or .icns.
-  agent-pager print-config <claude|codex|opencode> [--dest DIR]
+  agent-pager print-config <claude|codex|opencode|antigravity> [--dest DIR]
         Print the config snippet for manual setup.
-  agent-pager hook <claude|codex|opencode>
+  agent-pager hook <claude|codex|opencode|antigravity>
         Read an agent hook payload on stdin and notify (used by the agents).
   agent-pager uninstall [--dest DIR]
   agent-pager --version
@@ -127,7 +128,7 @@ fn dest_flag(args: &[String]) -> PathBuf {
 fn agent_arg(args: &[String]) -> Result<Agent, String> {
     args.first()
         .and_then(|a| Agent::parse(a))
-        .ok_or_else(|| "expected an agent: claude, codex or opencode".to_string())
+        .ok_or_else(|| "expected an agent: claude, codex, opencode or antigravity".to_string())
 }
 
 /// Runs inside a pager app (launched by `install` via LaunchServices).
@@ -163,10 +164,41 @@ fn hook(agent: Agent) {
     let mut raw = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut raw) {
         log::error(&format!("hook {}: reading stdin: {e}", agent.key()));
+        if agent == Agent::Antigravity {
+            println!(r#"{{"decision":"allow"}}"#);
+        }
         return;
     }
     if let Err(e) = deliver(agent, &raw) {
         log::error(&format!("hook {}: {e}", agent.key()));
+    }
+    if agent == Agent::Antigravity {
+        println!("{}", antigravity_hook_response(&raw));
+    }
+}
+
+/// Antigravity requires hook commands to write a JSON decision object to stdout.
+fn antigravity_hook_response(raw: &str) -> &'static str {
+    let payload = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let event = payload
+        .as_ref()
+        .and_then(|v| v.get("hookEventName").and_then(|e| e.as_str()));
+    match event {
+        Some("PreToolUse") => r#"{"decision":"allow"}"#,
+        Some("Stop") => r#"{"decision":"stop"}"#,
+        Some("PostToolUse" | "SessionStart" | "PreInvocation" | "PostInvocation") => "{}",
+        _ => {
+            if payload.as_ref().is_some_and(|v| v.get("toolCall").is_some()) {
+                r#"{"decision":"allow"}"#
+            } else if payload
+                .as_ref()
+                .is_some_and(|v| v.get("terminationReason").is_some() || v.get("executionNum").is_some())
+            {
+                r#"{"decision":"stop"}"#
+            } else {
+                r#"{"decision":"allow"}"#
+            }
+        }
     }
 }
 
@@ -183,7 +215,7 @@ fn deliver(agent: Agent, raw: &str) -> Result<(), String> {
         log::debug(&format!("hook {}: event ignored", agent.key()));
         return Ok(());
     };
-    let session = ["session_id", "session"]
+    let session = ["session_id", "session", "conversationId"]
         .iter()
         .find_map(|k| payload.get(*k).and_then(|v| v.as_str()))
         .unwrap_or_default();
@@ -265,6 +297,10 @@ fn test(agent: Agent, kind: Option<&str>) -> Result<(), String> {
         (Agent::OpenCode, "input") => json!({"hook_event_name":"input","message":"Which database should I use?","cwd":cwd}),
         (Agent::OpenCode, "error") => json!({"hook_event_name":"error","message":"Provider returned 529 overloaded","cwd":cwd}),
         (Agent::OpenCode, "finished") => json!({"hook_event_name":"finished","cwd":cwd}),
+        (Agent::Antigravity, "approval") => json!({"hookEventName":"PreToolUse","toolCall":{"name":"ask_permission","args":{"Action":"command","Target":"git push","Reason":"Antigravity needs permission to run git push"}},"cwd":cwd,"workspacePaths":[cwd]}),
+        (Agent::Antigravity, "input") => json!({"hookEventName":"PreToolUse","toolCall":{"name":"ask_question","args":{"questions":[{"question":"Which database should I use?","options":["Postgres","SQLite"]}]}},"cwd":cwd,"workspacePaths":[cwd]}),
+        (Agent::Antigravity, "error") => json!({"hookEventName":"Stop","terminationReason":"ERROR","error":"Model request failed","fullyIdle":true,"cwd":cwd,"workspacePaths":[cwd]}),
+        (Agent::Antigravity, "finished") => json!({"hookEventName":"Stop","terminationReason":"NO_TOOL_CALL","fullyIdle":true,"last_assistant_message":"All tests pass. I refactored the parser and added three regression tests.","cwd":cwd,"workspacePaths":[cwd]}),
         _ => return Err(format!("unknown kind {kind:?}; use approval, input, finished or error")),
     };
     deliver(agent, &payload.to_string())?;
@@ -274,7 +310,7 @@ fn test(agent: Agent, kind: Option<&str>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_duplicate;
+    use super::{antigravity_hook_response, is_duplicate};
 
     #[test]
     fn duplicate_within_window_is_suppressed() {
@@ -282,5 +318,21 @@ mod tests {
         assert!(!is_duplicate(&key));
         assert!(is_duplicate(&key));
         assert!(!is_duplicate(&format!("{key}-other")));
+    }
+
+    #[test]
+    fn antigravity_responses_are_valid_passthrough_json() {
+        assert_eq!(
+            antigravity_hook_response(r#"{"hookEventName":"PreToolUse","toolCall":{"name":"ask_question"}}"#),
+            r#"{"decision":"allow"}"#
+        );
+        assert_eq!(
+            antigravity_hook_response(r#"{"hookEventName":"Stop","terminationReason":"NO_TOOL_CALL"}"#),
+            r#"{"decision":"stop"}"#
+        );
+        assert_eq!(
+            antigravity_hook_response(r#"{"hookEventName":"PostToolUse"}"#),
+            "{}"
+        );
     }
 }

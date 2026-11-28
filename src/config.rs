@@ -43,6 +43,15 @@ pub fn print(agent: Agent, dest: &Path) {
             println!("// Optional: set \"attention.notifications\": false in ~/.config/opencode/cli.json to avoid duplicates.");
             print!("{}", opencode_plugin(dest));
         }
+        Agent::Antigravity => {
+            let snippet = serde_json::json!({
+                "agent-pager": crate::setup::antigravity_hook_entry(dest),
+            });
+            println!("# Merge into ~/.gemini/config/hooks.json:");
+            println!("# Optional: turn off Antigravity's built-in notifications to avoid duplicates");
+            println!("# (\"notifications\": false in ~/.gemini/antigravity-cli/settings.json, or Settings -> Notifications in the app).");
+            println!("{}", serde_json::to_string_pretty(&snippet).expect("serializable"));
+        }
     }
 }
 

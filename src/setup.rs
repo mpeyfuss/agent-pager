@@ -14,6 +14,7 @@ use crate::install::{self, exe_path};
 const CODEX_BEGIN: &str = "# >>> agent-pager >>>";
 const CODEX_END: &str = "# <<< agent-pager <<<";
 const OPENCODE_HEADER: &str = "// agent-pager: forwards OpenCode events";
+const ANTIGRAVITY_HOOK_NAME: &str = "agent-pager";
 
 pub fn setup(assets: Option<&Path>, dest: &Path, extra_claude_dirs: &[PathBuf]) -> Result<(), String> {
     install::install(assets, dest)?;
@@ -32,8 +33,12 @@ pub fn setup(assets: Option<&Path>, dest: &Path, extra_claude_dirs: &[PathBuf]) 
         report("OpenCode", setup_opencode(&dir, dest));
         configured += 1;
     }
+    if let Some(dir) = antigravity_dir() {
+        report("Antigravity", setup_antigravity(&dir, dest));
+        configured += 1;
+    }
     if configured == 0 {
-        println!("No agent configs found (~/.claude*, ~/.codex, ~/.config/opencode).");
+        println!("No agent configs found (~/.claude*, ~/.codex, ~/.config/opencode, ~/.gemini/config).");
     }
 
     println!("\nDone. Restart running agent sessions to pick up the hooks.");
@@ -53,6 +58,9 @@ pub fn teardown(dest: &Path, extra_claude_dirs: &[PathBuf]) -> Result<(), String
     }
     if let Some(dir) = opencode_dir() {
         report("OpenCode", teardown_opencode(&dir));
+    }
+    if let Some(dir) = antigravity_dir() {
+        report("Antigravity", teardown_antigravity(&dir));
     }
     install::uninstall(dest)
 }
@@ -97,6 +105,20 @@ fn codex_dir() -> Option<PathBuf> {
 fn opencode_dir() -> Option<PathBuf> {
     let dir = crate::home().join(".config/opencode");
     dir.is_dir().then_some(dir)
+}
+
+fn antigravity_dir() -> Option<PathBuf> {
+    let gemini = crate::home().join(".gemini");
+    let config = gemini.join("config");
+    let detected = [
+        config.clone(),
+        gemini.join("antigravity"),
+        gemini.join("antigravity-cli"),
+        gemini.join("antigravity-ide"),
+    ]
+    .iter()
+    .any(|d| d.is_dir());
+    detected.then_some(config)
 }
 
 // ---------- Claude Code ----------
@@ -299,6 +321,61 @@ fn teardown_opencode(dir: &Path) -> Result<String, String> {
     }
 }
 
+// ---------- Antigravity ----------
+
+pub fn antigravity_hook_entry(dest: &Path) -> Value {
+    let exe = exe_path(dest, Agent::Antigravity).to_string_lossy().into_owned();
+    let cmd = format!("{exe} hook antigravity");
+    json!({
+        "PreToolUse": [
+            {
+                "matcher": "ask_question|ask_permission",
+                "hooks": [
+                    { "type": "command", "command": cmd, "timeout": 10 }
+                ]
+            }
+        ],
+        "Stop": [
+            { "type": "command", "command": cmd, "timeout": 10 }
+        ]
+    })
+}
+
+fn setup_antigravity(dir: &Path, dest: &Path) -> Result<String, String> {
+    let path = dir.join("hooks.json");
+    let mut root = read_json(&path)?;
+    let obj = root.as_object_mut().ok_or("hooks.json is not a JSON object")?;
+    let entry = antigravity_hook_entry(dest);
+    if obj.get(ANTIGRAVITY_HOOK_NAME) == Some(&entry) {
+        return Ok("already configured".into());
+    }
+    let existed = obj.contains_key(ANTIGRAVITY_HOOK_NAME);
+    obj.insert(ANTIGRAVITY_HOOK_NAME.to_string(), entry);
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    write_with_backup(&path, &to_pretty(&root))?;
+    if existed {
+        Ok("updated PreToolUse, Stop hooks".into())
+    } else {
+        Ok("added PreToolUse, Stop hooks".into())
+    }
+}
+
+fn teardown_antigravity(dir: &Path) -> Result<String, String> {
+    let path = dir.join("hooks.json");
+    if !path.exists() {
+        return Ok("nothing to remove".into());
+    }
+    let mut root = read_json(&path)?;
+    let Some(obj) = root.as_object_mut() else {
+        return Ok("nothing to remove".into());
+    };
+    if obj.remove(ANTIGRAVITY_HOOK_NAME).is_none() {
+        return Ok("nothing to remove".into());
+    }
+    write_with_backup(&path, &to_pretty(&root))?;
+    Ok("removed hooks".into())
+}
+
 // ---------- helpers ----------
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -393,6 +470,29 @@ mod tests {
 
         teardown_codex(&dir).unwrap();
         assert_eq!(fs::read_to_string(dir.join("config.toml")).unwrap(), original);
+    }
+
+    #[test]
+    fn antigravity_setup_is_idempotent_and_reversible() {
+        let dir = tmpdir("antigravity");
+        let dest = PathBuf::from("/Apps");
+        let original = json!({
+            "my-linter": {
+                "PostToolUse": [{ "matcher": "run_command", "hooks": [{ "type": "command", "command": "./lint.sh" }] }]
+            }
+        });
+        fs::write(dir.join("hooks.json"), to_pretty(&original)).unwrap();
+
+        assert_eq!(setup_antigravity(&dir, &dest).unwrap(), "added PreToolUse, Stop hooks");
+        assert_eq!(setup_antigravity(&dir, &dest).unwrap(), "already configured");
+        let v = read_json(&dir.join("hooks.json")).unwrap();
+        assert!(v["agent-pager"]["Stop"].is_array());
+        assert!(v["agent-pager"]["PreToolUse"].is_array());
+        assert_eq!(v["my-linter"], original["my-linter"]);
+
+        assert_eq!(teardown_antigravity(&dir).unwrap(), "removed hooks");
+        assert_eq!(read_json(&dir.join("hooks.json")).unwrap(), original);
+        assert_eq!(teardown_antigravity(&dir).unwrap(), "nothing to remove");
     }
 }
 
