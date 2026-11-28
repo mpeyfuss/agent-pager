@@ -38,7 +38,8 @@ From source instead: `cargo build --release && ./target/release/agent-pager setu
 
 ## Releasing
 
-Bump `version` in `Cargo.toml` (and run `cargo build` so `Cargo.lock` follows), then push to `main`.
+Bump `version` in `Cargo.toml` (e.g. `cargo set-version --bump minor && cargo update --workspace`
+with `cargo-edit`, or edit `Cargo.toml` and run `cargo build` so `Cargo.lock` follows), then push to `main`.
 If no `v<version>` release exists yet, GitHub Actions builds the universal binary, tags the
 commit and publishes the release. The workflow can also be run by hand from the Actions tab.
 
